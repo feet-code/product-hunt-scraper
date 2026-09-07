@@ -1,155 +1,150 @@
-# Product Hunt → Magic Catalog importer
+# Product Hunt → Magic Catalog
 
-A slow, restart-safe pipeline that discovers Product Hunt product pages, reads the linked product website when that site's robots policy permits it, asks Gemini to create an independently written and renamed catalog record, and optionally publishes the result to Magic Catalog's D1 database and Vectorize index.
+Slow direct scraping of Product Hunt's product sitemap and pages, adaptive Gemini generation, and scalable catalog publishing. No Product Hunt API or login is required.
 
-This project scrapes Product Hunt directly; it does not use the Product Hunt API. Use it only for access you are authorized to make.
-
-## What it does
-
-1. Downloads Product Hunt's public `product_about_sitemap.xml.gz` sitemap.
-2. Selects up to 10,000 `/products/<slug>` pages, newest-updated first by default.
-3. Fetches Product Hunt pages sequentially with a 5–7 second delay by default.
-4. Extracts the product name, descriptions, categories, and `Visit website` destination from server-rendered metadata.
-5. Checks the external site's `robots.txt`, rejects private/local network destinations, and reads one external landing page when allowed.
-6. Tries Gemini models in this exact fallback order:
-
-   - `gemini-3.8-flash`
-   - `gemini-3.7-flash`
-   - `gemini-3.6-flash`
-   - `gemini-3.5-flash`
-   - `gemini-3-flash`
-   - `gemini-2.5-flash`
-
-7. Rejects output that contains the source brand, a confusingly similar new name, a duplicate generated name, or an exact seven-word source phrase.
-8. Saves every completed stage in SQLite and can publish idempotent batches to Magic Catalog.
-
-The source name and URLs are sent only to Magic Catalog's protected import endpoint for validation and deduplication; that endpoint hashes every source identifier before D1 persistence. They are not included in the public product record. The local ignored SQLite checkpoint retains the research needed to resume. Raw pages, images, reviews, comments, and maker profiles are not stored.
-
-## Setup
-
-Requires Python 3.11 or newer.
-
-### Windows PowerShell
+## First-time setup (Windows PowerShell)
 
 ```powershell
+git clone https://github.com/feet-code/product-hunt-scraper.git
+cd product-hunt-scraper
 py -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -e .
 Copy-Item .env.example .env
 ```
 
-### macOS or Linux
+Python 3.11+ is required. On macOS/Linux use `python3 -m venv .venv`, `source .venv/bin/activate`, and `cp .env.example .env`.
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
+The crawler discovers the public product sitemap, reports its total count, and selects the newest products by default. `--order sitemap` keeps sitemap order; `--offset` selects a later slice. There is no longer a hard 10,000-product ceiling.
+
+Source requests remain sequential with a default 5–7 second delay and bounded Retry-After/backoff. `--product-hunt-delay` and `--product-hunt-jitter` can increase spacing. One external landing page is read when its robots policy allows, with public-network/redirect checks; `--no-external` skips that enrichment for faster scraping. Raw pages, images, comments, and maker profiles are not stored. Use direct scraping only for access you are authorized to make.
+
+The checkpoint remains `.state/scraper.sqlite3`; existing state is migrated additively without discarding successful work. `--state` and `--preview` customize paths, and `--env-file` selects a different dotenv file. `export --output .state/review.jsonl` writes public catalog records from saved drafts without network requests.
+
+## Upgrade to batching
+
+```powershell
+git pull
 python -m pip install -e .
-cp .env.example .env
 ```
 
-Put your Gemini key in `.env`:
+Keep your existing `.state` directory. Completed scrapes, generated records, and published products are retained. Existing Product Hunt drafts get a shared general-software intent when none was previously stored; they do not consume a Gemini call just to migrate. Already published legacy products remain published and are not copied into the new storage path.
 
-```text
-GEMINI_API_KEY=...
-```
+Before publishing, update **magic-catalog** too:
 
-No Product Hunt credentials or cookies are used.
-
-## Test three products first
-
-This scrapes and transforms three products but does not change Magic Catalog:
-
-```bash
-ph-magic-import run --limit 3
-```
-
-Review the generated JSONL at `.state/products.jsonl`, then inspect progress at any time:
-
-```bash
-ph-magic-import status
-```
-
-The SQLite checkpoint is `.state/scraper.sqlite3`. Interrupting with Ctrl+C is safe; run the same command again to continue from the last completed stage.
-
-## Publish to Magic Catalog
-
-The matching Magic Catalog change adds `/api/admin/import-products`. Deploy that change, set a separate secret on the Magic Catalog Worker, and use the same value in this repository:
-
-```bash
-# Run in the magic-catalog repository.
-npx wrangler secret put ADMIN_IMPORT_TOKEN
+```powershell
+git pull
+npm ci
 npm run deploy
 ```
 
+If scalable resources have never been created, first run `npm run scale:setup` in magic-catalog. Its updated ingest endpoint reports measured D1 writes. The importers check that capability before sending products and stop if the old version is deployed. They use **ADMIN_REINDEX_TOKEN**, not the legacy ADMIN_IMPORT_TOKEN.
+
+## Three independent queues
+
+```powershell
+# Scrape only: no Gemini key or catalog token needed.
+ph-magic-import run --stage scrape --limit 3
+
+# Generate from saved sources: no source-site requests.
+ph-magic-import run --stage generate --limit 3
+
+# Publish saved products: no Gemini key or source-site requests.
+ph-magic-import run --stage publish --limit 3
+```
+
+Review `.state/products.jsonl` after generation. These are compact public product records that Magic Catalog renders into pages, not HTML or copies of research pages.
+
+Scale up by raising the total selected limit:
+
+```powershell
+ph-magic-import run --stage scrape --limit 100000
+ph-magic-import run --stage generate --limit 100000
+ph-magic-import run --stage publish --limit 100000
+```
+
+Or keep the one-command workflow:
+
+```powershell
+ph-magic-import run --limit 100000 --publish
+```
+
+`run` first scrapes the selected inventory, then generates from the checkpoint, then optionally publishes. Gemini quota exhaustion pauses generation, but any valid generated products are still eligible for publishing. Use `--stage scrape` whenever you want to continue collecting source data independently. The default limit is still 3. A larger limit is a ceiling, not a guarantee the source contains that many distinct accessible products.
+
+`--scrape-only` is an alias for `--stage scrape`. `--offline` prevents source-site requests. Ctrl+C preserves completed stages; rerun the same command to resume. These are local CLI commands, not unattended scheduled jobs; daily quota resets do not restart a stopped process automatically.
+
+## Adaptive Gemini batches
+
+- Start with **25 products per ordinary generateContent request**.
+- Grow toward **50, then 100** after fully valid responses. Reduce the size after invalid/truncated output. The target size is saved across restarts and shared by both scrapers.
+- Size the request down further if its estimated input tokens would exceed the configured TPM allowance. Output is capped at 60,000 tokens with a per-product allowance; 100 is a ceiling, not a fixed count or a throughput promise.
+- Send short research signals and compact output fields; no HTML, articles, or images.
+- Match outputs to input IDs, reject unknown/duplicate IDs, source-brand leakage, copied phrases, and duplicate generated names.
+- Save each valid product independently. Recover complete items from a truncated JSON response and retry only unfinished items, at most three validation attempts per item per invocation.
+- The fallback chain remains `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3-flash`, `gemini-2.5-flash`.
+
+```powershell
+ph-magic-import run --stage generate --limit 100000 --batch-size 25 --max-batch-size 100
+```
+
+This packs multiple products into normal API requests. It does **not** use Google's paid asynchronous Batch API or enable billing.
+
+## Shared, restart-safe quotas
+
+Both repositories default to **the same SQLite ledger** at `~/.magic-catalog/quotas.sqlite3` (your user home directory). Running them on the same computer and OS user shares Gemini request accounting, cooldowns, intent registration, and publishing budgets. Each scraper still has its own `.state` research checkpoint.
+
+Set these `.env` values to your actual AI Studio limits; defaults are conservative assumptions, not guaranteed Google quotas:
+
 ```text
-# product-hunt-scraper/.env
-MAGIC_CATALOG_URL=https://magic-catalog.cloudwebsites.workers.dev
-MAGIC_CATALOG_IMPORT_TOKEN=the-same-long-random-value
+GEMINI_RPD=20
+GEMINI_RPM=5
+GEMINI_TPM=25000
+GEMINI_QUOTA_SCOPE=default-project
+MAGIC_WRITE_SCOPE=cloudflare-account
 ```
 
-Publish the initial test records:
+The limits above apply per configured model. The input-token estimate uses serialized request size; server 429s remain authoritative. The ledger reserves attempts **before** sending them, including failed requests. It saves model cooldowns, honors Retry-After, treats recognized daily-quota errors as unavailable until midnight Pacific, and skips missing models for 24 hours. Quota changes and cooldowns survive Ctrl+C and restarts.
 
-```bash
-ph-magic-import run --limit 3 --publish
-```
+Temporary availability waits are bounded to two minutes by default, with short interruptible waits. Use `--wait-minutes 0` to stop immediately when no model is ready. Daily exhaustion prints the next eligible time and leaves unfinished items queued. Model/key errors do not poison every remaining source row.
 
-Then expand the same restart-safe run to as many as 10,000:
-
-```bash
-ph-magic-import run --limit 10000 --publish
-```
-
-Already published source products are skipped. If D1 succeeds but Vectorize temporarily fails, Magic Catalog returns a retryable error; rerunning the same command safely retries indexing without duplicating the D1 product.
-
-## Useful commands
-
-```bash
-# Keep sitemap order instead of sorting by last-modified time.
-ph-magic-import run --limit 10 --order sitemap
-
-# Process a later slice.
-ph-magic-import run --offset 1000 --limit 100 --publish
-
-# Export all transformed records again without network requests.
-ph-magic-import export --output .state/review.jsonl
-
-# Allow failed items to be attempted again without losing successful stages.
+```powershell
+ph-magic-import quota-status
+ph-magic-import status
 ph-magic-import retry-failed
-ph-magic-import run --limit 10000 --publish
 ```
 
-## Polite crawling defaults
+If you customize `MAGIC_QUOTA_DB`, give both repositories the **same absolute file path**. `GEMINI_QUOTA_SCOPE` identifies the actual Google project; do not change it merely to reset quotas. Two different API keys for the same project still need the same scope. Other programs and separate computers do not automatically share this ledger; leave headroom for their usage. Run at most one process per scraper checkpoint.
 
-- Exactly one request is in flight at a time.
-- Product Hunt requests wait at least 5 seconds plus 0–2 seconds of jitter.
-- External-site requests wait at least 2 seconds plus 0–1 second of jitter per host.
-- HTTP 429 and temporary server errors honor `Retry-After` and use exponential backoff.
-- Product Hunt pages, external pages, and sitemap responses have strict size limits.
-- The crawler never signs in, solves challenges, rotates identities, or bypasses access controls.
-- External redirects and DNS results are checked to prevent private-network requests.
+## Measured scalable publishing
 
-The delays can be increased from the command line. Product Hunt delay values below two seconds are clamped to two seconds:
+Set the following in each scraper's `.env`:
 
-```bash
-ph-magic-import run --limit 25 --product-hunt-delay 8 --product-hunt-jitter 4
+```text
+GEMINI_API_KEY=your-key
+MAGIC_CATALOG_URL=https://magic-catalog.cloudwebsites.workers.dev
+MAGIC_CATALOG_IMPORT_TOKEN=the-same-value-as-the-Worker-ADMIN_REINDEX_TOKEN
 ```
 
-At the defaults, a 10,000-product run is intentionally long. The persistent state is designed for pausing overnight and resuming later.
+Publishing uses `/api/admin/catalog/ingest`: R2 product bodies, sharded D1 metadata and FTS, and **59 shared intent vectors**. It never creates a vector per imported product. Source research and credentials are not sent in public product records.
 
-## Failure handling
+Generation batch size and import batch size are independent. The CLI permits an import ceiling of 25, but automatically honors the server's lower advertised limit, currently **7 products/request**. The current database statements plus intent and object writes need this smaller batch to leave room under the Worker Free request limits. Intent definitions are sent once per destination in the shared ledger.
 
-Each item records its current stage, failure count, last error, and completed payloads. A single scrape or Gemini failure does not discard other progress. Publish-batch failures stop the run because they usually indicate a deployment, token, D1, or Vectorize problem that should be fixed before sending more batches.
+The default publishing allowance is **80,000 D1 rows/day shared between both importers**, leaving nominal headroom below D1 Free's 100,000. This counts measured metadata, index, FTS, and intent writes reported by D1; it does not assume one product equals one row.
 
-Run with `--verbose` before the command for more diagnostics:
+Before the first measured batch, reserve 100 rows per product. Afterwards estimate using the highest observed rows per product plus 50% and four extra rows. Successful batches reconcile reservations to actual reported usage. Failed/uncertain batches retain their conservative reservations; their exact saved products remain queued for idempotent retry. A missing acknowledgement or missing usage report never marks products as published. This is a local planning budget, not a guarantee against unobserved account traffic or an unexpectedly expensive query.
 
-```bash
-ph-magic-import --verbose run --limit 3
+```powershell
+ph-magic-import run --stage publish --limit 100000 --daily-row-budget 60000
 ```
+
+The budget resets at midnight UTC. Other applications on the account consume the same Cloudflare free allowance, so lower this budget if necessary. Renamed products use stable source-derived slugs; replaying a partially successful batch upserts the same products. Preserve both the research checkpoint and shared ledger for reliable progress/quota accounting.
+
+If vector indexing was unavailable, `npm run vector:reindex` in Magic Catalog repairs persisted intents. Neither scraper changes Cloudflare billing or provisions paid resources.
 
 ## Tests
 
-```bash
+```powershell
 python -m unittest discover -s tests -v
 ```
 
-The importer uses only Python's standard library, so there are no runtime packages beyond the editable install itself.
+Tests cover partial/truncated responses, wrong and duplicate IDs, adaptive sizing, model fallback, persisted daily/minute quotas, Pacific daylight-saving resets, intent reuse, server-advertised import caps, measured write accounting, partial failures, stable identities, and preservation of existing checkpoints.

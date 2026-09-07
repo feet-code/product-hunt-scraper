@@ -12,6 +12,8 @@ from .http import PoliteHttpClient, RobotsPolicy
 from .pipeline import PipelineStats, ProductHuntPipeline, write_preview
 from .publisher import MagicCatalogPublisher
 from .state import StateStore
+from .bulk import run_bulk, saved_entries
+from .batch import Ledger
 
 
 def _path(value: str) -> Path:
@@ -37,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit",
         type=int,
         default=3,
-        help="target at most this many Product Hunt products (default: 3; max: 10000)",
+        help="target at most this many Product Hunt products (default: 3; no fixed maximum)",
     )
     run.add_argument("--offset", type=int, default=0, help="skip this many sitemap entries")
     run.add_argument(
@@ -70,7 +72,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout", type=float, default=30.0)
     run.add_argument("--http-attempts", type=int, default=5)
     run.add_argument("--max-failures", type=int, default=3)
-    run.add_argument("--publish-batch-size", type=int, default=10)
+    run.add_argument("--publish-batch-size", type=int, default=25)
+    run.add_argument("--stage",choices=['all','scrape','generate','publish'],default='all')
+    run.add_argument("--scrape-only",action='store_true')
+    run.add_argument("--offline",action='store_true')
+    run.add_argument("--batch-size",type=int,default=25)
+    run.add_argument("--max-batch-size",type=int,default=100)
+    run.add_argument("--daily-row-budget",type=int,default=80000)
+    run.add_argument("--wait-minutes",type=float,default=2)
+    subparsers.add_parser('quota-status')
 
     status = subparsers.add_parser("status", help="show persistent checkpoint counts")
     status.add_argument("--state", type=_path, default=_path(".state/scraper.sqlite3"))
@@ -100,12 +110,12 @@ def _client(settings: Settings, *, max_attempts: int) -> PoliteHttpClient:
 
 
 def run_command(arguments: argparse.Namespace) -> int:
-    if not 1 <= arguments.limit <= 10_000:
-        raise ValueError("--limit must be between 1 and 10000.")
+    if arguments.limit < 1:
+        raise ValueError("--limit must be positive.")
     if arguments.offset < 0:
         raise ValueError("--offset must be zero or greater.")
-    if not 1 <= arguments.publish_batch_size <= 20:
-        raise ValueError("--publish-batch-size must be between 1 and 20.")
+    if not 1 <= arguments.publish_batch_size <= 25:
+        raise ValueError("--publish-batch-size must be between 1 and 25.")
 
     settings = Settings.from_environment(
         state_path=arguments.state,
@@ -118,55 +128,32 @@ def run_command(arguments: argparse.Namespace) -> int:
         request_timeout_seconds=arguments.timeout,
         max_http_attempts=arguments.http_attempts,
     )
-    if not settings.gemini_api_key:
-        raise ValueError("Set GEMINI_API_KEY in .env before running the pipeline.")
-
-    crawl_client = _client(settings, max_attempts=settings.max_http_attempts)
-    gemini_client = _client(settings, max_attempts=1)
-    publisher_client = _client(settings, max_attempts=settings.max_http_attempts)
-    transformer = GeminiTransformer(
-        client=gemini_client,
-        api_key=settings.gemini_api_key,
-        models=settings.gemini_models,
-    )
-    publisher = (
-        MagicCatalogPublisher(
-            client=publisher_client,
-            site_url=settings.magic_catalog_url,
-            import_token=settings.magic_catalog_import_token,
-        )
-        if arguments.publish
-        else None
-    )
+    if arguments.scrape_only:
+        if arguments.publish:
+            raise ValueError('--scrape-only cannot be combined with --publish')
+        arguments.stage = 'scrape'
+    crawl_client = _client(settings,max_attempts=settings.max_http_attempts)
+    gemini_client = _client(settings,max_attempts=1)
+    publisher_client = _client(settings,max_attempts=1)
     stats = PipelineStats()
     with StateStore(settings.state_path) as state:
         pipeline = ProductHuntPipeline(
             state=state,
             crawl_client=crawl_client,
             robots=RobotsPolicy(crawl_client, settings.user_agent),
-            transformer=transformer,
-            publisher=publisher,
+            transformer=None,
+            publisher=None,
             sitemap_url=settings.sitemap_url,
             preview_path=settings.preview_path,
             follow_external=not arguments.no_external,
             publish_batch_size=arguments.publish_batch_size,
             max_failures=arguments.max_failures,
         )
-        entries = pipeline.discover(
-            limit=arguments.limit,
-            offset=arguments.offset,
-            order=arguments.order,
-            stats=stats,
-        )
-        pipeline.run(entries, stats=stats)
-        result = {
-            "run": stats.to_dict(),
-            "checkpoint": state.status_counts(),
-            "state": str(settings.state_path),
-            "preview": str(settings.preview_path),
-        }
-    print(json.dumps(result, indent=2, sort_keys=True))
-    return 1 if stats.failed else 0
+        if arguments.stage in ('all','scrape') and not arguments.offline:
+            entries = pipeline.discover(limit=arguments.limit,offset=arguments.offset,order=arguments.order,stats=stats)
+        else:
+            entries = saved_entries(state,arguments.limit,arguments.offset)
+        return run_bulk(pipeline,entries,arguments,settings,gemini_client,publisher_client)
 
 
 def status_command(arguments: argparse.Namespace) -> int:
@@ -202,6 +189,14 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
+        if arguments.command == 'quota-status':
+            from .config import configured_models
+            ledger = Ledger()
+            try:
+                print(json.dumps(ledger.summary(configured_models()),indent=2))
+            finally:
+                ledger.db.close()
+            return 0
         if arguments.command == "run":
             return run_command(arguments)
         if arguments.command == "status":

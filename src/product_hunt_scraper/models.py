@@ -77,6 +77,7 @@ class CatalogDraft:
     workflow: list[str]
     keywords: list[str]
     metrics: list[str]
+    intentKey: str = "general-software-utilities"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -84,6 +85,7 @@ class CatalogDraft:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> CatalogDraft:
         return cls(
+            intentKey=str(value.get("intentKey") or "general-software-utilities"),
             name=str(value["name"]),
             category=str(value["category"]),
             audience=str(value["audience"]),

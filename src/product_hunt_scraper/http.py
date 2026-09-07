@@ -30,10 +30,12 @@ class HttpError(RuntimeError):
         *,
         status: int | None = None,
         body: str | None = None,
+        retry_after: float | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.body = body
+        self.retry_after = retry_after
 
 
 @dataclass(frozen=True)
@@ -94,6 +96,8 @@ class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
         self.validate_redirects = validate_redirects
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        if req.get_method() != "GET" or any(k.lower() in {"authorization", "x-goog-api-key"} for k, _ in req.header_items()):
+            raise HttpError("Refusing credential-bearing or POST redirect.", status=code)
         if self.validate_redirects:
             validate_public_http_url(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
@@ -202,6 +206,7 @@ class PoliteHttpClient:
         *,
         max_bytes: int,
         validate_external_url: bool = False,
+        headers: Mapping[str, str] | None = None,
         accept: str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.1",
     ) -> HttpResponse:
         return self._request(
@@ -211,7 +216,7 @@ class PoliteHttpClient:
             max_bytes=max_bytes,
             validate_external_url=validate_external_url,
             accept=accept,
-            extra_headers={},
+            extra_headers=headers or {},
         )
 
     def post_json(
@@ -296,6 +301,7 @@ class PoliteHttpClient:
                     f"HTTP {error.code} for {url}",
                     status=int(error.code),
                     body=error_body,
+                    retry_after=self._retry_after(headers),
                 )
                 retryable = int(error.code) in RETRYABLE_STATUS
                 retry_after = self._retry_after(headers)

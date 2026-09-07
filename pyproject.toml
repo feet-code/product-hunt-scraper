@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "product-hunt-magic-catalog-importer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Restart-safe Product Hunt research and Magic Catalog import pipeline"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["tzdata>=2025.1"]
 
 [project.scripts]
 ph-magic-import = "product_hunt_scraper.cli:main"

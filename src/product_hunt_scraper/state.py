@@ -307,38 +307,20 @@ class StateStore:
         return counts
 
     def transformed_records(self, limit: int | None = None) -> list[dict]:
-        query = (
-            "SELECT source_json, external_json, draft_json, generation_model, "
-            "source_content_hash FROM work_items WHERE draft_json IS NOT NULL "
-            "ORDER BY ordinal"
-        )
-        parameters: tuple[int, ...] = ()
-        if limit is not None:
-            query += " LIMIT ?1"
-            parameters = (limit,)
-        rows = self.connection.execute(query, parameters).fetchall()
-        records: list[dict] = []
+        from .batch import stable_product
+        query = "SELECT * FROM work_items WHERE draft_json IS NOT NULL AND source_json IS NOT NULL ORDER BY ordinal,source_url"
+        rows = self.connection.execute(query + (" LIMIT ?" if limit else ""), (limit,) if limit else ()).fetchall()
+        records = []
         for row in rows:
-            source = SourceProduct.from_dict(json.loads(row["source_json"]))
-            external = (
-                ExternalPage.from_dict(json.loads(row["external_json"]))
-                if row["external_json"]
-                else None
-            )
-            draft = CatalogDraft.from_dict(json.loads(row["draft_json"]))
-            records.append(
-                {
-                    "externalId": source.external_id,
-                    "sourceUrl": source.source_url,
-                    "sourceWebsiteUrl": (
-                        external.final_url
-                        if external and not external.skipped_reason
-                        else source.website_url
-                    ),
-                    "sourceName": source.source_name,
-                    "sourceContentHash": row["source_content_hash"],
-                    "generationModel": row["generation_model"],
-                    "product": draft.to_dict(),
-                }
-            )
+            key = "scalable-product:"+row["source_url"]
+            stored = self.connection.execute("SELECT value FROM metadata WHERE key=?",(key,)).fetchone()
+            if stored:
+                product = json.loads(stored[0])
+            else:
+                draft = CatalogDraft.from_dict(json.loads(row["draft_json"]))
+                product = stable_product(draft.to_dict(),row["source_url"],"ph",utc_now().replace("+00:00","Z"))
+                if row["published_slug"]:
+                    product["slug"] = row["published_slug"]
+                self.set_metadata(key,json.dumps(product,separators=(",",":")))
+            records.append(product)
         return records
