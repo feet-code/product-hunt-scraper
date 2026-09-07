@@ -1,0 +1,227 @@
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+
+from .config import DEFAULT_PRODUCT_SITEMAP, Settings, load_dotenv
+from .gemini import GeminiTransformer
+from .http import PoliteHttpClient, RobotsPolicy
+from .pipeline import PipelineStats, ProductHuntPipeline, write_preview
+from .publisher import MagicCatalogPublisher
+from .state import StateStore
+
+
+def _path(value: str) -> Path:
+    return Path(value).expanduser().resolve()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ph-magic-import",
+        description="Scrape Product Hunt slowly, synthesize original products, and import them into Magic Catalog.",
+    )
+    parser.add_argument(
+        "--env-file",
+        type=_path,
+        default=_path(".env"),
+        help="dotenv file to load (default: .env)",
+    )
+    parser.add_argument("--verbose", action="store_true")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run = subparsers.add_parser("run", help="discover, scrape, transform, and optionally publish")
+    run.add_argument(
+        "--limit",
+        type=int,
+        default=3,
+        help="target at most this many Product Hunt products (default: 3; max: 10000)",
+    )
+    run.add_argument("--offset", type=int, default=0, help="skip this many sitemap entries")
+    run.add_argument(
+        "--order", choices=("newest", "sitemap"), default="newest"
+    )
+    run.add_argument(
+        "--publish",
+        action="store_true",
+        help="write transformed records to Magic Catalog D1 and Vectorize",
+    )
+    run.add_argument(
+        "--no-external",
+        action="store_true",
+        help="do not fetch the external website linked from each Product Hunt page",
+    )
+    run.add_argument("--state", type=_path, default=_path(".state/scraper.sqlite3"))
+    run.add_argument(
+        "--preview", type=_path, default=_path(".state/products.jsonl")
+    )
+    run.add_argument("--sitemap-url", default=DEFAULT_PRODUCT_SITEMAP)
+    run.add_argument(
+        "--product-hunt-delay",
+        type=float,
+        default=5.0,
+        help="minimum seconds between Product Hunt requests (minimum enforced: 2)",
+    )
+    run.add_argument("--product-hunt-jitter", type=float, default=2.0)
+    run.add_argument("--external-delay", type=float, default=2.0)
+    run.add_argument("--external-jitter", type=float, default=1.0)
+    run.add_argument("--timeout", type=float, default=30.0)
+    run.add_argument("--http-attempts", type=int, default=5)
+    run.add_argument("--max-failures", type=int, default=3)
+    run.add_argument("--publish-batch-size", type=int, default=10)
+
+    status = subparsers.add_parser("status", help="show persistent checkpoint counts")
+    status.add_argument("--state", type=_path, default=_path(".state/scraper.sqlite3"))
+
+    export = subparsers.add_parser("export", help="export transformed products as JSONL")
+    export.add_argument("--state", type=_path, default=_path(".state/scraper.sqlite3"))
+    export.add_argument("--output", type=_path, default=_path(".state/products.jsonl"))
+    export.add_argument("--limit", type=int)
+
+    retry = subparsers.add_parser(
+        "retry-failed", help="reset failure counters while preserving completed stages"
+    )
+    retry.add_argument("--state", type=_path, default=_path(".state/scraper.sqlite3"))
+    return parser
+
+
+def _client(settings: Settings, *, max_attempts: int) -> PoliteHttpClient:
+    return PoliteHttpClient(
+        user_agent=settings.user_agent,
+        product_hunt_delay_seconds=settings.product_hunt_delay_seconds,
+        product_hunt_jitter_seconds=settings.product_hunt_jitter_seconds,
+        external_delay_seconds=settings.external_delay_seconds,
+        external_jitter_seconds=settings.external_jitter_seconds,
+        timeout_seconds=settings.request_timeout_seconds,
+        max_attempts=max_attempts,
+    )
+
+
+def run_command(arguments: argparse.Namespace) -> int:
+    if not 1 <= arguments.limit <= 10_000:
+        raise ValueError("--limit must be between 1 and 10000.")
+    if arguments.offset < 0:
+        raise ValueError("--offset must be zero or greater.")
+    if not 1 <= arguments.publish_batch_size <= 20:
+        raise ValueError("--publish-batch-size must be between 1 and 20.")
+
+    settings = Settings.from_environment(
+        state_path=arguments.state,
+        preview_path=arguments.preview,
+        sitemap_url=arguments.sitemap_url,
+        product_hunt_delay_seconds=arguments.product_hunt_delay,
+        product_hunt_jitter_seconds=arguments.product_hunt_jitter,
+        external_delay_seconds=arguments.external_delay,
+        external_jitter_seconds=arguments.external_jitter,
+        request_timeout_seconds=arguments.timeout,
+        max_http_attempts=arguments.http_attempts,
+    )
+    if not settings.gemini_api_key:
+        raise ValueError("Set GEMINI_API_KEY in .env before running the pipeline.")
+
+    crawl_client = _client(settings, max_attempts=settings.max_http_attempts)
+    gemini_client = _client(settings, max_attempts=1)
+    publisher_client = _client(settings, max_attempts=settings.max_http_attempts)
+    transformer = GeminiTransformer(
+        client=gemini_client,
+        api_key=settings.gemini_api_key,
+        models=settings.gemini_models,
+    )
+    publisher = (
+        MagicCatalogPublisher(
+            client=publisher_client,
+            site_url=settings.magic_catalog_url,
+            import_token=settings.magic_catalog_import_token,
+        )
+        if arguments.publish
+        else None
+    )
+    stats = PipelineStats()
+    with StateStore(settings.state_path) as state:
+        pipeline = ProductHuntPipeline(
+            state=state,
+            crawl_client=crawl_client,
+            robots=RobotsPolicy(crawl_client, settings.user_agent),
+            transformer=transformer,
+            publisher=publisher,
+            sitemap_url=settings.sitemap_url,
+            preview_path=settings.preview_path,
+            follow_external=not arguments.no_external,
+            publish_batch_size=arguments.publish_batch_size,
+            max_failures=arguments.max_failures,
+        )
+        entries = pipeline.discover(
+            limit=arguments.limit,
+            offset=arguments.offset,
+            order=arguments.order,
+            stats=stats,
+        )
+        pipeline.run(entries, stats=stats)
+        result = {
+            "run": stats.to_dict(),
+            "checkpoint": state.status_counts(),
+            "state": str(settings.state_path),
+            "preview": str(settings.preview_path),
+        }
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 1 if stats.failed else 0
+
+
+def status_command(arguments: argparse.Namespace) -> int:
+    with StateStore(arguments.state) as state:
+        result = state.status_counts()
+    print(json.dumps({"state": str(arguments.state), "counts": result}, indent=2))
+    return 0
+
+
+def export_command(arguments: argparse.Namespace) -> int:
+    if arguments.limit is not None and arguments.limit < 1:
+        raise ValueError("--limit must be positive when provided.")
+    with StateStore(arguments.state) as state:
+        records = state.transformed_records(arguments.limit)
+    write_preview(arguments.output, records)
+    print(json.dumps({"exported": len(records), "output": str(arguments.output)}))
+    return 0
+
+
+def retry_command(arguments: argparse.Namespace) -> int:
+    with StateStore(arguments.state) as state:
+        reset = state.reset_failures()
+    print(json.dumps({"reset": reset, "state": str(arguments.state)}))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    arguments = parser.parse_args(argv)
+    load_dotenv(arguments.env_file)
+    logging.basicConfig(
+        level=logging.DEBUG if arguments.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    try:
+        if arguments.command == "run":
+            return run_command(arguments)
+        if arguments.command == "status":
+            return status_command(arguments)
+        if arguments.command == "export":
+            return export_command(arguments)
+        if arguments.command == "retry-failed":
+            return retry_command(arguments)
+        parser.error("Unknown command.")
+    except KeyboardInterrupt:
+        logging.getLogger(__name__).warning(
+            "Interrupted. Completed stages are checkpointed; rerun the same command to resume."
+        )
+        return 130
+    except Exception as error:
+        logging.getLogger(__name__).exception("%s", error)
+        return 1
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
