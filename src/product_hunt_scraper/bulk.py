@@ -43,7 +43,7 @@ def run_bulk(pipeline,entries,args,settings,gemini_client,publish_client):
     ledger = Ledger()
     paused = False
     try:
-        if args.stage in ('all','generate'):
+        if args.stage in ('all','generate','generate-publish'):
             jobs = []
             for entry in entries:
                 item = state.get_work_item(entry.url)
@@ -60,7 +60,7 @@ def run_bulk(pipeline,entries,args,settings,gemini_client,publish_client):
                 except Paused as error:
                     LOG.warning('%s',error)
                     paused = True
-        if args.stage=='publish' or (args.stage=='all' and args.publish):
+        if args.stage in ('publish','generate-publish') or (args.stage in ('all','generate') and args.publish):
             products = []
             identities = {}
             for entry in entries:

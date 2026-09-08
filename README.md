@@ -1,6 +1,6 @@
 # Product Hunt → Magic Catalog
 
-Slow direct scraping of Product Hunt's product sitemap and pages, adaptive Gemini generation, and scalable catalog publishing. No Product Hunt API or login is required.
+Slow direct scraping of Product Hunt's product sitemap and pages, fixed-batch Gemini generation, and scalable catalog publishing. No Product Hunt API or login is required.
 
 ## First-time setup (Windows PowerShell)
 
@@ -73,21 +73,28 @@ ph-magic-import run --limit 100000 --publish
 
 `--scrape-only` is an alias for `--stage scrape`. `--offline` prevents source-site requests. Ctrl+C preserves completed stages; rerun the same command to resume. These are local CLI commands, not unattended scheduled jobs; daily quota resets do not restart a stopped process automatically.
 
-## Adaptive Gemini batches
+## Fixed Gemini batches
 
-- Start with **25 products per ordinary generateContent request**.
-- Grow toward **50, then 100** after fully valid responses. Reduce the size after invalid/truncated output. The target size is saved across restarts and shared by both scrapers.
-- Size the request down further if its estimated input tokens would exceed the configured TPM allowance. Output is capped at 60,000 tokens with a per-product allowance; 100 is a ceiling, not a fixed count or a throughput promise.
-- Send short research signals and compact output fields; no HTML, articles, or images.
-- Match outputs to input IDs, reject unknown/duplicate IDs, source-brand leakage, copied phrases, and duplicate generated names.
-- Save each valid product independently. Recover complete items from a truncated JSON response and retry only unfinished items, at most three validation attempts per item per invocation.
-- The fallback chain remains `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3-flash`, `gemini-2.5-flash`.
+Generation uses **50 products per request**, every full batch. It ignores the old saved adaptive size, and neither successful responses, partial validation failures, nor HTTP errors change the configured batch size. Only the final remainder (including unfinished retries) can contain fewer products. Set a different fixed size explicitly with `--batch-size` if needed. The old `--max-batch-size` option is accepted for compatibility but has no effect.
+
+- HTTP 503 triggers fallback with the **same products and payload**, plus a persisted cooldown of at least five minutes (or a longer Retry-After). It indicates temporary service unavailability; it is not treated as daily quota exhaustion.
+- Valid products are saved immediately. Failed validation items return to the end of the pending queue, joining other pending products in full batches where possible. Only unfinished items retry, up to three validation attempts per run.
+- RPM, TPM, daily request limits, and persisted cooldowns still apply. If a full batch exceeds configured `GEMINI_TPM`, generation pauses before sending it; it does **not** silently split into smaller calls. Choose a smaller explicit batch size, or correct the TPM setting only if your AI Studio project actually permits more.
+- Source-brand, copied-phrase, ID, and field validation remain enabled. No paid Batch API is used.
 
 ```powershell
-ph-magic-import run --stage generate --limit 100000 --batch-size 25 --max-batch-size 100
+ph-magic-import run --stage generate --limit 100000
 ```
 
-This packs multiple products into normal API requests. It does **not** use Google's paid asynchronous Batch API or enable billing.
+### Generate and publish saved scrapes together
+
+```powershell
+ph-magic-import run --stage generate-publish --limit 100000
+```
+
+Equivalent: `run --stage generate --limit 100000 --publish`. Both use saved scrapes without opening the source site or rediscovering listings. They generate first, then publish available products; if generation pauses for quota or service availability, already generated products are still published. This is sequential, not concurrent. Ctrl+C preserves generated products; rerun to continue or use `--stage publish` to publish them directly.
+
+`run --limit 100000 --publish` still uses the full scrape → generate → publish flow and can perform more discovery. Add `--offline` to that command to use saved sources only, or use the explicit `generate-publish` stage above.
 
 ## Shared, restart-safe quotas
 
@@ -147,4 +154,4 @@ If vector indexing was unavailable, `npm run vector:reindex` in Magic Catalog re
 python -m unittest discover -s tests -v
 ```
 
-Tests cover partial/truncated responses, wrong and duplicate IDs, adaptive sizing, model fallback, persisted daily/minute quotas, Pacific daylight-saving resets, intent reuse, server-advertised import caps, measured write accounting, partial failures, stable identities, and preservation of existing checkpoints.
+Tests cover partial/truncated responses, wrong and duplicate IDs, fixed batch sizes and 503 fallback, model fallback, persisted daily/minute quotas, Pacific daylight-saving resets, intent reuse, server-advertised import caps, measured write accounting, partial failures, stable identities, and preservation of existing checkpoints.

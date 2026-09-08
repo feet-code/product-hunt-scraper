@@ -1,4 +1,4 @@
-"""Shared quota ledger and adaptive generation; mirrored in both scraper repos."""
+"""Shared quota ledger and fixed-size generation; mirrored in both scraper repos."""
 from __future__ import annotations
 import copy
 import hashlib
@@ -94,8 +94,10 @@ class Ledger:
     def block(self,model,error):
         now = self.clock()
         body = (error.body or '').lower()
-        daily = any(s in body for s in ('perday','per_day','per day','daily'))
+        daily = error.status == 429 and any(s in body for s in ('perday','per_day','per day','daily'))
         until = next_day(now) if daily else now+max(65,float(getattr(error,'retry_after',None) or 0))
+        if error.status == 503:
+            until = now+max(300,float(getattr(error,'retry_after',None) or 0))
         if error.status in (400,404):
             until = now+86400
         if error.status in (401,403):
@@ -135,21 +137,20 @@ def salvage_items(text):
 
 
 class BatchGenerator:
-    def __init__(self,client,api_key,models,ledger,batch_size=25,max_batch_size=100,wait_minutes=2):
+    def __init__(self,client,api_key,models,ledger,batch_size=50,max_batch_size=100,wait_minutes=2):
         if not api_key:
             raise ValueError('GEMINI_API_KEY is required for generation only.')
-        if not 1 <= batch_size <= max_batch_size <= 100:
-            raise ValueError('Use 1 <= --batch-size <= --max-batch-size <= 100.')
+        if not 1 <= batch_size <= 100:
+            raise ValueError('Use 1 <= --batch-size <= 100.')
         self.client,self.api_key,self.models,self.ledger = client,api_key,tuple(models),ledger
         self.client.max_attempts = 1  # Every attempted request must be charged in the ledger.
-        self.minimum = batch_size
-        self.maximum = max_batch_size
+        # max_batch_size remains accepted for old callers; adaptive state is ignored.
         if not math.isfinite(wait_minutes) or wait_minutes < 0:
             raise ValueError("--wait-minutes must be finite and nonnegative")
         if not self.models:
             raise ValueError("At least one Gemini model is required")
         self.wait_seconds = wait_minutes*60
-        self.size = min(max_batch_size,max(1,int(ledger.get('adaptive:'+ledger.scope,batch_size))))
+        self.size = batch_size
 
     def payload(self,jobs):
         schema = copy.deepcopy(PRODUCT_JSON_SCHEMA)
@@ -186,12 +187,10 @@ class BatchGenerator:
             group = list(pending)[:self.size]
             payload = self.payload(group)
             tokens = math.ceil(len(json.dumps(payload))/3)  # Conservative input estimate, not output quota.
-            while tokens > self.ledger.tpm and len(group)>1:
-                group = group[:max(1,len(group)//2)]
-                payload = self.payload(group)
-                tokens = math.ceil(len(json.dumps(payload))/3)
             if tokens > self.ledger.tpm:
-                raise Paused('One source exceeds configured GEMINI_TPM; raise it only to your actual AI Studio limit.')
+                raise Paused(f'Fixed batch of {len(group)} products needs about {tokens} input tokens, '
+                    f'above configured GEMINI_TPM={self.ledger.tpm}. No request sent and batch size unchanged. '
+                    'Use a smaller explicit --batch-size or set GEMINI_TPM to your actual AI Studio limit.')
             model = next((m for m in self.models if self.ledger.claim(m,tokens)),None)
             if model is None:
                 ready = min(self.ledger.ready_at(m,tokens) for m in self.models)
@@ -207,7 +206,8 @@ class BatchGenerator:
                 items = salvage_items(_response_text(json.loads(response.text())))
             except HttpError as error:
                 self.ledger.block(model,error)
-                LOG.warning('Gemini %s HTTP %s; saved cooldown and trying next model',model,error.status)
+                LOG.warning('Gemini %s HTTP %s (%s); saved cooldown and trying next model with the same %d products',
+                    model,error.status,'temporary service unavailability' if error.status == 503 else 'request failed',len(group))
                 continue
             except (ValueError,KeyError,TypeError):
                 items = []
@@ -248,9 +248,8 @@ class BatchGenerator:
                 tries[job['id']] = tries.get(job['id'],0)+1
                 if tries[job['id']] < 3:
                     pending.append(job)
-            self.size = min(self.maximum,max(self.size,len(group))*2) if not failed else max(1,len(group)//2)
-            self.ledger.set('adaptive:'+self.ledger.scope,self.size)
-            LOG.info('Saved %d/%d products; next target batch %d',len(accepted),len(group),self.size)
+            LOG.info('Saved %d/%d products; fixed batch size %d; %d pending (only unfinished items retry)',
+                     len(accepted),len(group),self.size,len(pending))
         if any(n>=3 for n in tries.values()):
             raise Paused('Some products failed validation three times; valid items saved. Rerun to retry only unfinished items.')
         return generated

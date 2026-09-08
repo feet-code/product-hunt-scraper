@@ -113,11 +113,42 @@ class BatchTests(unittest.TestCase):
         with self.assertRaises(Paused): BatchGenerator(client,'key',['m'],self.ledger,1,1,0).generate([job('a')],Mock(),lambda _:False)
         client.post_json.assert_not_called()
 
-    def test_batch_grows_and_persists(self):
-        client=Mock();client.post_json.return_value=gemini([{'id':'a','product':DRAFT}])
-        engine=BatchGenerator(client,'key',['m'],self.ledger,1,8,0)
-        engine.generate([job('a')],Mock(),lambda _:False)
-        self.assertEqual(BatchGenerator(client,'key',['m'],self.ledger,1,8,0).size,2)
+    def test_fixed_fifty_ignores_old_adaptive_checkpoint_and_validation_failure(self):
+        self.ledger.set('adaptive:'+self.ledger.scope,2)
+        self.ledger.tpm=1000000
+        client=Mock(); sizes=[]; attempts=[0]
+        def post(url,payload,**kwargs):
+            research=json.loads(payload['contents'][0]['parts'][0]['text'])['research']
+            sizes.append(len(research)); attempts[0]+=1
+            # Save 49/50 on the first call; its failed item goes behind the next 50.
+            items=research[1:] if attempts[0]==1 else research
+            return gemini([{'id':r['id'],'product':DRAFT} for r in items])
+        client.post_json.side_effect=post
+        engine=BatchGenerator(client,'key',['m'],self.ledger,wait_minutes=0)
+        saved=[]
+        engine.generate([job(str(i)) for i in range(100)],lambda j,*rest:saved.append(j['id']),lambda _:False)
+        self.assertEqual(sizes,[50,50,1]); self.assertEqual(len(set(saved)),100)
+        self.assertEqual(engine.size,50)
+        self.assertEqual(BatchGenerator(client,'key',['m'],self.ledger).size,50)
+
+    def test_503_falls_back_with_identical_fifty_and_temporary_cooldown(self):
+        self.ledger.tpm=1000000
+        client=Mock()
+        items=[{'id':str(i),'product':DRAFT} for i in range(50)]
+        client.post_json.side_effect=[HttpError('busy',status=503,body='daily service unavailable',retry_after=400),gemini(items)]
+        saved=[]
+        engine=BatchGenerator(client,'key',['busy','ready'],self.ledger,wait_minutes=0)
+        engine.generate([job(str(i)) for i in range(50)],lambda j,*rest:saved.append(j['id']),lambda _:False)
+        self.assertEqual(client.post_json.call_args_list[0].args[1],client.post_json.call_args_list[1].args[1])
+        self.assertEqual(len(saved),50);self.assertEqual(engine.size,50)
+        self.assertEqual(self.ledger.ready_at('busy'),self.clock[0]+400)
+
+    def test_oversized_fixed_batch_pauses_without_smaller_requests(self):
+        self.ledger.tpm=1
+        client=Mock();engine=BatchGenerator(client,'key',['m'],self.ledger,wait_minutes=0)
+        with self.assertRaisesRegex(Paused,'Fixed batch of 50'):
+            engine.generate([job(str(i)) for i in range(50)],Mock(),lambda _:False)
+        self.assertEqual(engine.size,50);client.post_json.assert_not_called()
 
     def test_publish_uses_server_batch_limit_and_measured_writes(self):
         client=Mock();client.get.return_value=response({'usageReportingVersion':1,'maxProducts':2})
