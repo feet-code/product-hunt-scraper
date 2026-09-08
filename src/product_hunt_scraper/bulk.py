@@ -12,10 +12,21 @@ from .pipeline import write_preview
 LOG = logging.getLogger(__name__)
 
 
-def saved_entries(state,limit,offset=0):
-    rows = state.connection.execute('SELECT source_url,last_modified FROM work_items ORDER BY ordinal,source_url LIMIT ? OFFSET ?',
-        (limit,offset)).fetchall()
-    return [SitemapEntry(r['source_url'],r['last_modified']) for r in rows]
+def saved_entries(state, limit, offset=0, *, stage="all", publish=False, max_failures=3):
+    # Filter completed and ineligible work before LIMIT so it cannot starve new rows.
+    ready = "source_json IS NOT NULL AND external_checked = 1 AND draft_json IS NULL AND attempts < ?"
+    if stage == "publish":
+        condition, parameters = "draft_json IS NOT NULL", []
+    elif stage == "generate" and not publish:
+        condition, parameters = ready, [max_failures]
+    else:
+        condition, parameters = f"(draft_json IS NOT NULL OR ({ready}))", [max_failures]
+    rows = state.connection.execute(
+        f"SELECT source_url, last_modified FROM work_items WHERE status != 'published' AND ({condition}) "
+        "ORDER BY ordinal, source_url LIMIT ? OFFSET ?",
+        (*parameters, limit, offset),
+    ).fetchall()
+    return [SitemapEntry(row['source_url'], row['last_modified']) for row in rows]
 
 
 def run_bulk(pipeline,entries,args,settings,gemini_client,publish_client):
@@ -84,5 +95,5 @@ def run_bulk(pipeline,entries,args,settings,gemini_client,publish_client):
         write_preview(settings.preview_path,state.transformed_records())
     print(json.dumps({'checkpoint':state.status_counts(),'selected':len(entries),'generation_paused':paused},indent=2))
     if not entries:
-        raise ValueError('No saved sources. Run --stage scrape first.')
+        LOG.info('No pending eligible products for this stage. Scrape more sources or check status/retry-failed.')
     return 1 if errors or paused else 0

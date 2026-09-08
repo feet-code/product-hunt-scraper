@@ -155,3 +155,30 @@ python -m unittest discover -s tests -v
 ```
 
 Tests cover partial/truncated responses, wrong and duplicate IDs, fixed batch sizes and 503 fallback, model fallback, persisted daily/minute quotas, Pacific daylight-saving resets, intent reuse, server-advertised import caps, measured write accounting, partial failures, stable identities, and preservation of existing checkpoints.
+
+
+## Scrape now, generate and publish later
+
+```bash
+# Save up to 1,000 sources first; no Gemini key needed for scraping.
+ph-magic-import run --stage scrape --limit 1000
+
+# Generate and publish pending saved sources, without contacting source sites.
+ph-magic-import run --stage generate --publish --limit 100000
+
+# Expand the selected sitemap inventory later, skipping completed scrapes.
+ph-magic-import run --stage scrape --limit 2000
+ph-magic-import run --stage generate --publish --limit 100000
+```
+
+Use the same `.state/scraper.sqlite3` file (or the same `--state` path) each time.
+Generation reuses saved drafts and publishing skips acknowledged products. Saved-data
+stages apply `--limit` to eligible pending records, so completed rows cannot hide
+newly scraped work. An empty queue exits successfully. `--offset` on these stages
+skips pending records; normally leave it at zero. Scrape limits still select a
+slice of the sitemap, so increase that limit to collect more products.
+
+Ctrl+C preserves each completed source, draft, and publish acknowledgment. If a
+publish response is lost, the stored stable product identity makes the retry
+idempotent. Generation finishes the selected pending batch before publishing;
+if Gemini pauses on quota, valid saved drafts can still be published in that run.

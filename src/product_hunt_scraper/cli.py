@@ -48,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--publish",
         action="store_true",
-        help="write transformed records to Magic Catalog D1 and Vectorize",
+        help="publish after generation (works with --stage generate or all)",
     )
     run.add_argument(
         "--no-external",
@@ -132,6 +132,8 @@ def run_command(arguments: argparse.Namespace) -> int:
         if arguments.publish:
             raise ValueError('--scrape-only cannot be combined with --publish')
         arguments.stage = 'scrape'
+    if arguments.stage == 'scrape' and arguments.publish:
+        raise ValueError('--stage scrape cannot be combined with --publish; use --stage generate --publish afterward.')
     crawl_client = _client(settings,max_attempts=settings.max_http_attempts)
     gemini_client = _client(settings,max_attempts=1)
     publisher_client = _client(settings,max_attempts=1)
@@ -152,7 +154,8 @@ def run_command(arguments: argparse.Namespace) -> int:
         if arguments.stage in ('all','scrape') and not arguments.offline:
             entries = pipeline.discover(limit=arguments.limit,offset=arguments.offset,order=arguments.order,stats=stats)
         else:
-            entries = saved_entries(state,arguments.limit,arguments.offset)
+            entries = saved_entries(state, arguments.limit, arguments.offset,
+                stage=arguments.stage, publish=arguments.publish, max_failures=arguments.max_failures)
         return run_bulk(pipeline,entries,arguments,settings,gemini_client,publisher_client)
 
 

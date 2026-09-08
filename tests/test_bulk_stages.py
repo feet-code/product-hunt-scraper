@@ -62,3 +62,59 @@ class StageTests(unittest.TestCase):
                     generator.generate.assert_called_once();publisher.publish.assert_called_once()
                     self.assertEqual(state.get_work_item(ready.url).status,'published')
                     self.assertIsNone(state.get_work_item(pending.url).draft)
+
+    def test_generate_publish_resumes_new_sources_after_reopening(self):
+        from product_hunt_scraper.bulk import saved_entries
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.db'
+            settings = SimpleNamespace(gemini_api_key='test', gemini_models=('test',),
+                magic_catalog_url='https://catalog.example', magic_catalog_import_token='test',
+                preview_path=Path(directory) / 'preview.jsonl')
+            args = SimpleNamespace(stage='generate', offline=False, max_failures=3,
+                publish=True, publish_batch_size=25, daily_row_budget=80000,
+                batch_size=25, max_batch_size=100, wait_minutes=0)
+            generated, published = [], []
+            def generate(jobs, save, exists):
+                for job in jobs:
+                    generated.append(job['id'])
+                    save(job, draft('New Name ' + str(len(generated))).to_dict(), 'test')
+            def publish(products, ack, batch_size):
+                for product in products:
+                    published.append(product['slug'])
+                    ack(product)
+            with patch('product_hunt_scraper.bulk.Ledger', return_value=Mock()), \
+                 patch('product_hunt_scraper.bulk.BatchGenerator') as generator, \
+                 patch('product_hunt_scraper.bulk.BulkPublisher') as publisher:
+                generator.return_value.generate.side_effect = generate
+                publisher.return_value.publish.side_effect = publish
+                for slug in ('one', 'two'):
+                    with StateStore(path) as state:
+                        entry = SitemapEntry('https://www.producthunt.com/products/' + slug)
+                        state.enqueue([entry])
+                        state.mark_scraped(entry.url, SourceProduct(slug, entry.url, 'SourceBrand'))
+                        state.mark_external_checked(entry.url, None)
+                        entries = saved_entries(state, 1, stage='generate', publish=True)
+                        self.assertEqual(entries, [entry])
+                        # Any source-site access would fail: this pipeline only has state.
+                        self.assertEqual(run_bulk(SimpleNamespace(state=state), entries, args,
+                            settings, Mock(), Mock()), 0)
+                        self.assertEqual(saved_entries(state, 1, stage='generate', publish=True), [])
+                self.assertEqual(len(generated), 2)
+                self.assertEqual(len(set(published)), 2)
+                with StateStore(path) as state:
+                    self.assertEqual(run_bulk(SimpleNamespace(state=state), [], args,
+                        settings, Mock(), Mock()), 0)
+
+    def test_saved_selection_excludes_queued_and_reuses_existing_draft(self):
+        from product_hunt_scraper.bulk import saved_entries
+        with tempfile.TemporaryDirectory() as directory, StateStore(Path(directory)/'state.db') as state:
+            entries = [SitemapEntry('https://www.producthunt.com/products/' + name)
+                       for name in ('queued', 'ready')]
+            state.enqueue(entries)
+            ready = entries[1]
+            state.mark_scraped(ready.url, SourceProduct('ready', ready.url, 'SourceBrand'))
+            state.mark_external_checked(ready.url, None)
+            state.mark_transformed(ready.url, draft('Saved Draft'), 'test', 'hash')
+            self.assertEqual(saved_entries(state, 1, stage='generate'), [])
+            self.assertEqual(saved_entries(state, 1, stage='generate', publish=True), [ready])
+            self.assertEqual(saved_entries(state, 1, stage='publish'), [ready])
