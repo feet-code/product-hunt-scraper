@@ -9,6 +9,7 @@ from .gemini import source_content_hash
 from .models import CatalogDraft, SitemapEntry
 from .pipeline import write_preview
 from .brand_audit import blocked_names, name_key, issues_for
+from .key_pool import GeminiKeyPoolLedger, PooledGeminiClient
 
 LOG = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ def _run_cycle(pipeline,entries,args,settings,gemini_client,publish_client):
                 state.mark_failed(entry.url,stage,type(error).__name__)
                 errors += 1
     ledger = Ledger()
+    key_pool = None
     paused = False
     try:
         def flush():
@@ -67,7 +69,9 @@ def _run_cycle(pipeline,entries,args,settings,gemini_client,publish_client):
                 if item.source and item.external_checked and not item.draft and item.status!='published' and item.attempts<args.max_failures:
                     jobs.append({'id':entry.url,'source':item.source,'external':item.external_page})
             if jobs:
-                transformer = BatchGenerator(gemini_client,settings.gemini_api_key,settings.gemini_models,ledger,
+                key_pool = GeminiKeyPoolLedger(ledger, settings.gemini_api_keys)
+                pooled_client = PooledGeminiClient(gemini_client, key_pool)
+                transformer = BatchGenerator(pooled_client,settings.gemini_api_key,settings.gemini_models,key_pool,
                     args.batch_size,args.max_batch_size,args.wait_minutes)
                 known_names = blocked_names(state)
                 transformer.on_batch = flush
@@ -81,6 +85,8 @@ def _run_cycle(pipeline,entries,args,settings,gemini_client,publish_client):
                     paused = True
         flush()
     finally:
+        if key_pool is not None:
+            key_pool.close()
         ledger.db.close()
     print(json.dumps({'checkpoint':state.status_counts(),'selected':len(entries),'generation_paused':paused},indent=2))
     if not entries:
