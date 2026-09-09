@@ -99,13 +99,23 @@ class GeminiKeyPoolLedger:
             return
         active = self._active_index
         self.ledgers[active].block(model, error)
-        # A 503 is model/service availability, not a key quota signal. Block the
-        # same model across the pool so BatchGenerator falls back to another model
-        # instead of burning one identical request per collaborator key.
+        # A 503 is model/service availability, not a key quota signal. Give the
+        # other keys the same temporary model cooldown without recording fake
+        # outcomes for requests that were never sent.
         if error.status == 503:
+            until = self.clock() + max(
+                300.0,
+                float(getattr(error, "retry_after", None) or 0),
+            )
             for index, ledger in enumerate(self.ledgers):
-                if index != active:
-                    ledger.block(model, error)
+                if index == active:
+                    continue
+                with ledger.db:
+                    ledger.db.execute(
+                        "INSERT INTO cooldown VALUES(?,?,?) "
+                        "ON CONFLICT(scope,model) DO UPDATE SET until=max(until,excluded.until)",
+                        (ledger.scope, model, until),
+                    )
 
     def summary(self, models: Iterable[str]) -> dict[str, object]:
         models = tuple(models)
