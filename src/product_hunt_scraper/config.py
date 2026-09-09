@@ -56,11 +56,7 @@ def configured_models() -> tuple[str, ...]:
 
 
 def configured_gemini_api_keys() -> tuple[str, ...]:
-    """Return authorized Gemini keys without ever logging or persisting their values.
-
-    GEMINI_API_KEYS is a comma-separated collaborator pool. GEMINI_API_KEY remains
-    supported for backwards compatibility and is included when it is distinct.
-    """
+    """Return authorized Gemini keys without logging or persisting their values."""
     values: list[str] = []
     raw_pool = os.getenv("GEMINI_API_KEYS", "").strip()
     if raw_pool:
@@ -78,7 +74,6 @@ class Settings:
     sitemap_url: str
     user_agent: str
     gemini_api_key: str
-    gemini_api_keys: tuple[str, ...]
     gemini_models: tuple[str, ...]
     magic_catalog_url: str
     magic_catalog_import_token: str
@@ -88,6 +83,13 @@ class Settings:
     external_jitter_seconds: float
     request_timeout_seconds: float
     max_http_attempts: int
+
+    @property
+    def gemini_api_keys(self) -> tuple[str, ...]:
+        configured = configured_gemini_api_keys()
+        if configured:
+            return configured
+        return (self.gemini_api_key,) if self.gemini_api_key else ()
 
     @classmethod
     def from_environment(
@@ -111,7 +113,6 @@ class Settings:
             user_agent=os.getenv("SCRAPER_USER_AGENT", DEFAULT_USER_AGENT).strip()
             or DEFAULT_USER_AGENT,
             gemini_api_key=gemini_api_keys[0] if gemini_api_keys else "",
-            gemini_api_keys=gemini_api_keys,
             gemini_models=configured_models(),
             magic_catalog_url=os.getenv(
                 "MAGIC_CATALOG_URL",
