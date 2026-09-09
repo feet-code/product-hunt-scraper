@@ -29,9 +29,10 @@ def saved_entries(state, limit, offset=0, *, stage="all", publish=False, max_fai
     return [SitemapEntry(row['source_url'], row['last_modified']) for row in rows]
 
 
-def run_bulk(pipeline,entries,args,settings,gemini_client,publish_client):
+def _run_cycle(pipeline,entries,args,settings,gemini_client,publish_client):
     state = pipeline.state
     errors = 0
+    should_publish = args.stage in ('publish', 'generate-publish') or (args.stage in ('all', 'generate') and args.publish)
     if args.stage in ('all','scrape') and not args.offline:
         for index,entry in enumerate(entries,1):
             item = state.get_work_item(entry.url)
@@ -54,6 +55,10 @@ def run_bulk(pipeline,entries,args,settings,gemini_client,publish_client):
     ledger = Ledger()
     paused = False
     try:
+        def flush():
+            if should_publish:
+                publish_saved(pipeline, entries, args, settings, publish_client, ledger)
+        flush()  # Drain saved drafts before spending another Gemini request.
         if args.stage in ('all','generate','generate-publish'):
             jobs = []
             for entry in entries:
@@ -63,6 +68,7 @@ def run_bulk(pipeline,entries,args,settings,gemini_client,publish_client):
             if jobs:
                 transformer = BatchGenerator(gemini_client,settings.gemini_api_key,settings.gemini_models,ledger,
                     args.batch_size,args.max_batch_size,args.wait_minutes)
+                transformer.on_batch = flush
                 def save(job,product,model):
                     draft = CatalogDraft.from_dict(product)
                     state.mark_transformed(job['id'],draft,model,source_content_hash(job['source'],job['external']))
@@ -71,29 +77,52 @@ def run_bulk(pipeline,entries,args,settings,gemini_client,publish_client):
                 except Paused as error:
                     LOG.warning('%s',error)
                     paused = True
-        if args.stage in ('publish','generate-publish') or (args.stage in ('all','generate') and args.publish):
-            products = []
-            identities = {}
-            for entry in entries:
-                item = state.get_work_item(entry.url)
-                if not item.draft or item.status=='published':
-                    continue
-                key = 'scalable-product:'+entry.url
-                stored = state.connection.execute('SELECT value FROM metadata WHERE key=?',(key,)).fetchone()
-                if stored:
-                    product = json.loads(stored[0])
-                else:
-                    product = stable_product(item.draft.to_dict(),entry.url,'ph',datetime.now(timezone.utc).isoformat().replace('+00:00','Z'))
-                    state.set_metadata(key,json.dumps(product,separators=(',',':')))
-                products.append(product)
-                identities[product['slug']] = entry.url
-            if products:
-                publisher = BulkPublisher(publish_client,ledger,settings.magic_catalog_url,settings.magic_catalog_import_token,args.daily_row_budget)
-                publisher.publish(products,lambda p:state.mark_published(identities[p['slug']],p['slug']),args.publish_batch_size)
+        flush()
     finally:
         ledger.db.close()
-        write_preview(settings.preview_path,state.transformed_records())
     print(json.dumps({'checkpoint':state.status_counts(),'selected':len(entries),'generation_paused':paused},indent=2))
     if not entries:
         LOG.info('No pending eligible products for this stage. Scrape more sources or check status/retry-failed.')
     return 1 if errors or paused else 0
+
+
+def publish_saved(pipeline, entries, args, settings, publish_client, ledger):
+    state = pipeline.state
+    products = []
+    identities = {}
+    for entry in entries:
+        item = state.get_work_item(entry.url)
+        if not item.draft or item.status=='published':
+            continue
+        key = 'scalable-product:'+entry.url
+        stored = state.connection.execute('SELECT value FROM metadata WHERE key=?',(key,)).fetchone()
+        if stored:
+            product = json.loads(stored[0])
+        else:
+            product = stable_product(item.draft.to_dict(),entry.url,'ph',datetime.now(timezone.utc).isoformat().replace('+00:00','Z'))
+            state.set_metadata(key,json.dumps(product,separators=(',',':')))
+        products.append(product)
+        identities[product['slug']] = entry.url
+    if products:
+        publisher = BulkPublisher(publish_client,ledger,settings.magic_catalog_url,settings.magic_catalog_import_token,args.daily_row_budget)
+        publisher.publish(products,lambda p:state.mark_published(identities[p['slug']],p['slug']),args.publish_batch_size)
+
+
+def run_bulk(pipeline, entries, args, settings, gemini_client, publish_client):
+    # Bounded cycles publish early even when the full inventory is very large.
+    cycle_size = max(1, getattr(args, 'batch_size', 50))
+    result = 0
+    try:
+        for start in range(0, len(entries), cycle_size):
+            LOG.info('Processing cycle %d-%d of %d', start + 1,
+                     min(start + cycle_size, len(entries)), len(entries))
+            cycle_result = _run_cycle(pipeline, entries[start:start + cycle_size], args,
+                                settings, gemini_client, publish_client)
+            result = max(result, cycle_result)
+            if cycle_result and args.stage != 'scrape':
+                break  # Preserve unfinished work when generation pauses.
+        if not entries:
+            LOG.info('No pending eligible products for this stage.')
+        return result
+    finally:
+        write_preview(settings.preview_path, pipeline.state.transformed_records())

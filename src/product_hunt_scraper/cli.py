@@ -70,6 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--external-delay", type=float, default=2.0)
     run.add_argument("--external-jitter", type=float, default=1.0)
     run.add_argument("--timeout", type=float, default=30.0)
+    run.add_argument("--gemini-timeout", type=float, default=180.0, help="Gemini response timeout in seconds (default: 180)")
     run.add_argument("--http-attempts", type=int, default=5)
     run.add_argument("--max-failures", type=int, default=3)
     run.add_argument("--publish-batch-size", type=int, default=25)
@@ -136,6 +137,9 @@ def run_command(arguments: argparse.Namespace) -> int:
         raise ValueError('--stage scrape cannot be combined with --publish; use --stage generate --publish afterward.')
     crawl_client = _client(settings,max_attempts=settings.max_http_attempts)
     gemini_client = _client(settings,max_attempts=1)
+    if not 5 <= arguments.gemini_timeout <= 1800:
+        raise ValueError('--gemini-timeout must be between 5 and 1800 seconds.')
+    gemini_client.timeout_seconds = arguments.gemini_timeout
     publisher_client = _client(settings,max_attempts=1)
     stats = PipelineStats()
     with StateStore(settings.state_path) as state:

@@ -41,6 +41,28 @@ GENERIC_NAME_TOKENS = {
     "tools",
     "work",
 }
+# Descriptive title words are not evidence of source-brand leakage.
+GENERIC_NAME_TOKENS.update("""
+workspace index world weekly analytics reports report code data search console
+ai for with the and your by from online free open source daily monthly platform
+assistant manager management tracker tracking builder maker generator editor
+video image text audio design team teams business personal smart plus pro
+product products marketing sales customer email automation automated digital
+notes note meeting meetings chat content development developer developers
+research intelligence artificial dashboard browser agent agents productivity
+""".split())
+
+
+def brand_identity(source_name: str) -> str:
+    # Product Hunt headings can append a tagline to the actual product name.
+    return re.split(r"\s*[:|]\s*|\s+[–—]\s+|\s+-\s+", source_name, maxsplit=1)[0].strip()
+
+
+def distinctive_brand_tokens(source_name: str) -> list[str]:
+    return [token for token in normalize_text(brand_identity(source_name)).split()
+            if len(token) >= 4 and token not in GENERIC_NAME_TOKENS]
+
+
 WORD_PATTERN = re.compile(r"[a-z0-9]+")
 
 
@@ -167,22 +189,23 @@ def transformation_issues(
     draft: CatalogDraft,
 ) -> list[str]:
     issues: list[str] = []
-    normalized_source_name = normalize_text(source.source_name)
+    normalized_source_name = normalize_text(brand_identity(source.source_name))
     normalized_public = normalize_text(public_draft_text(draft))
     public_tokens = set(normalized_public.split())
     if (
         len(normalized_source_name) >= 3
+        and any(token not in GENERIC_NAME_TOKENS for token in normalized_source_name.split())
         and f" {normalized_source_name} " in f" {normalized_public} "
     ):
         issues.append("source brand appears in public copy")
-    for token in normalized_source_name.split():
+    for token in distinctive_brand_tokens(source.source_name):
         if (
             len(token) >= 4
             and token not in GENERIC_NAME_TOKENS
             and token in public_tokens
         ):
             issues.append(f"source brand token appears in public copy: {token}")
-    if _dice_similarity(source.source_name, draft.name) >= 0.62:
+    if _dice_similarity(brand_identity(source.source_name), draft.name) >= 0.62:
         issues.append("replacement name is too similar to source name")
 
     original_ngrams = _word_ngrams(source_text(source, external_page), 7)
@@ -249,7 +272,7 @@ def _response_text(payload: object) -> str:
     if not isinstance(parts, list):
         raise ValueError("Gemini returned no content parts")
     text = "".join(
-        str(part.get("text") or "") for part in parts if isinstance(part, dict)
+        str(part.get("text") or "") for part in parts if isinstance(part, dict) and not part.get("thought")
     ).strip()
     if not text:
         raise ValueError("Gemini returned an empty product")
@@ -272,11 +295,7 @@ def _model_payload(
         }
     facts = {
         "source_brand_to_never_repeat": source.source_name,
-        "source_brand_tokens_to_avoid": [
-            token
-            for token in normalize_text(source.source_name).split()
-            if len(token) >= 4 and token not in GENERIC_NAME_TOKENS
-        ],
+        "source_brand_tokens_to_avoid": distinctive_brand_tokens(source.source_name),
         "product_hunt_signals": {
             "tagline": source.tagline[:800],
             "description": source.description[:4_000],

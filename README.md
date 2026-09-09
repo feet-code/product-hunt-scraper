@@ -69,7 +69,7 @@ Or keep the one-command workflow:
 ph-magic-import run --limit 100000 --publish
 ```
 
-`run` first scrapes the selected inventory, then generates from the checkpoint, then optionally publishes. Gemini quota exhaustion pauses generation, but any valid generated products are still eligible for publishing. Use `--stage scrape` whenever you want to continue collecting source data independently. The default limit is still 3. A larger limit is a ceiling, not a guarantee the source contains that many distinct accessible products.
+`run` processes bounded cycles: scrape up to `--batch-size` sources, generate, optionally publish, then repeat. Gemini quota exhaustion pauses generation, but any valid generated products are still eligible for publishing. Use `--stage scrape` whenever you want to continue collecting source data independently. The default limit is still 3. A larger limit is a ceiling, not a guarantee the source contains that many distinct accessible products.
 
 `--scrape-only` is an alias for `--stage scrape`. `--offline` prevents source-site requests. Ctrl+C preserves completed stages; rerun the same command to resume. These are local CLI commands, not unattended scheduled jobs; daily quota resets do not restart a stopped process automatically.
 
@@ -180,5 +180,28 @@ slice of the sitemap, so increase that limit to collect more products.
 
 Ctrl+C preserves each completed source, draft, and publish acknowledgment. If a
 publish response is lost, the stored stable product identity makes the retry
-idempotent. Generation finishes the selected pending batch before publishing;
+idempotent. Each Gemini response publishes its valid saved products before the next request;
 if Gemini pauses on quota, valid saved drafts can still be published in that run.
+
+## Publish throughout short runs
+
+```bash
+# Already scraped: generate → publish → generate → publish.
+ph-magic-import run --stage generate-publish --limit 100000 --batch-size 10
+
+# Full pipeline: scrape 10 → generate → publish → repeat.
+ph-magic-import run --publish --limit 100000 --batch-size 10
+```
+
+`--stage generate` alone remains preview-only. Add `--publish` or use
+`--stage generate-publish` for publishing. Partial successes publish before retrying
+unfinished outputs. A publish failure stops the run with drafts safely checkpointed.
+
+Gemini now has its own `--gemini-timeout` (180 seconds by default); `--timeout`
+continues to control crawling. Increase `--gemini-timeout 300` for slower responses.
+HTTP 503 still falls back with the same fixed batch size. Incomplete JSON does not
+by itself prove token exhaustion: logs now show `finishReason`, output tokens,
+thinking tokens, and the requested output cap. The output allowance is increased,
+and thinking is disabled for Gemini 2.5 Flash. Other models retain their defaults.
+Ordinary descriptive words from source titles are allowed; distinctive source
+names/tokens and confusingly similar replacement names are still rejected.

@@ -66,11 +66,20 @@ class BatchLoggingTests(unittest.TestCase):
             gemini([{'id':'a','product':DRAFT}],truncate=True),
             gemini([{'id':'b','product':second}]),
         ]
+        events = []
+        original = client.post_json.side_effect
+        def request(*args, **kwargs):
+            events.append('request')
+            return original[len([e for e in events if e == 'request']) - 1]
+        original = list(original)
+        client.post_json.side_effect = request
+        generator = BatchGenerator(client,'key',['m'],self.ledger,batch_size=2,wait_minutes=0)
+        generator.on_batch = lambda: events.append('publish')
         with self.assertLogs('product_hunt_scraper.batch',level='INFO') as logs:
-            BatchGenerator(client,'key',['m'],self.ledger,batch_size=2,wait_minutes=0).generate(
-                [job('a'),job('b')],Mock(),lambda _:False)
+            generator.generate([job('a'),job('b')],Mock(),lambda _:False)
+        self.assertEqual(events, ['request', 'publish', 'request', 'publish'])
         output = '\n'.join(logs.output)
-        self.assertIn('response JSON was truncated; complete items were salvaged',output)
+        self.assertIn('response JSON incomplete or malformed; complete items were salvaged',output)
         self.assertIn('missing from Gemini response=1',output)
         self.assertIn('1 unfinished will retry',output)
 

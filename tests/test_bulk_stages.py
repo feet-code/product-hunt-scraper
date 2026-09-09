@@ -118,3 +118,33 @@ class StageTests(unittest.TestCase):
             self.assertEqual(saved_entries(state, 1, stage='generate'), [])
             self.assertEqual(saved_entries(state, 1, stage='generate', publish=True), [ready])
             self.assertEqual(saved_entries(state, 1, stage='publish'), [ready])
+
+    def test_all_stage_publishes_before_scraping_next_cycle(self):
+        with tempfile.TemporaryDirectory() as directory, StateStore(Path(directory)/'state.db') as state:
+            entries = [SitemapEntry('https://www.producthunt.com/products/' + name) for name in ('one', 'two')]
+            state.enqueue(entries)
+            events = []
+            def scrape(url, last):
+                events.append('scrape')
+                return SourceProduct(url.rsplit('/', 1)[-1], url, 'SourceBrand')
+            pipeline = SimpleNamespace(state=state, _scrape_source=scrape, _external_page=lambda source:None)
+            args = SimpleNamespace(stage='all', offline=False, max_failures=3, publish=True,
+                batch_size=1, max_batch_size=100, wait_minutes=0, publish_batch_size=25, daily_row_budget=80000)
+            settings = SimpleNamespace(gemini_api_key='test', gemini_models=['m'],
+                magic_catalog_url='https://example.com', magic_catalog_import_token='test',
+                preview_path=Path(directory)/'preview.jsonl')
+            def generate(jobs, save, exists):
+                events.append('generate')
+                for job in jobs:
+                    save(job, draft('Unique '+job['id'].rsplit('/', 1)[-1]).to_dict(), 'm')
+            def publish(products, ack, size):
+                events.append('publish')
+                for product in products:
+                    ack(product)
+            with patch('product_hunt_scraper.bulk.Ledger',return_value=Mock()), \
+                 patch('product_hunt_scraper.bulk.BatchGenerator') as generator, \
+                 patch('product_hunt_scraper.bulk.BulkPublisher') as publisher:
+                generator.return_value.generate.side_effect=generate
+                publisher.return_value.publish.side_effect=publish
+                self.assertEqual(run_bulk(pipeline,entries,args,settings,Mock(),Mock()),0)
+            self.assertEqual(events,['scrape','generate','publish','scrape','generate','publish'])
