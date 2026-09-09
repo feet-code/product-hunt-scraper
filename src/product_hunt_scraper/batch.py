@@ -8,7 +8,7 @@ import math
 import os
 import sqlite3
 import time
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -200,25 +200,63 @@ class BatchGenerator:
                 time.sleep(min(15,max(1,ready-self.ledger.clock())))
                 continue
             LOG.info('Gemini %s: %d products, estimated %d input tokens',model,len(group),tokens)
+            response_truncated = False
+            response_problem = None
+            request_started = time.monotonic()
             try:
                 response = self.client.post_json('https://generativelanguage.googleapis.com/v1beta/models/'+quote(model,safe='')+':generateContent',
                     payload,max_bytes=4000000,headers={'x-goog-api-key':self.api_key})
-                items = salvage_items(_response_text(json.loads(response.text())))
+                response_text = _response_text(json.loads(response.text()))
+                try:
+                    decoded = json.loads(response_text)
+                    items = decoded.get('items',[]) if isinstance(decoded,dict) else []
+                except json.JSONDecodeError:
+                    response_truncated = True
+                    items = salvage_items(response_text)
+                if not isinstance(items,list):
+                    response_problem = 'items was not an array'
+                    items = []
             except HttpError as error:
                 self.ledger.block(model,error)
-                LOG.warning('Gemini %s HTTP %s (%s); saved cooldown and trying next model with the same %d products',
-                    model,error.status,'temporary service unavailability' if error.status == 503 else 'request failed',len(group))
+                if error.status is None:
+                    LOG.warning(
+                        'Gemini %s request failed before an HTTP response after %.1fs: %s; saved cooldown and trying next model with the same %d products',
+                        model,time.monotonic()-request_started,error,len(group))
+                else:
+                    LOG.warning(
+                        'Gemini %s HTTP %s after %.1fs: %s; saved cooldown and trying next model with the same %d products',
+                        model,error.status,time.monotonic()-request_started,error,len(group))
                 continue
-            except (ValueError,KeyError,TypeError):
+            except (ValueError,KeyError,TypeError) as error:
                 items = []
+                response_problem = f'{type(error).__name__}: {error}'
+                LOG.warning('Gemini %s response could not be parsed: %s; all %d products remain unfinished',
+                    model,response_problem,len(group))
             waiting_since = self.ledger.clock()
             expected = {j['id']:j for j in group}
             counts = {}
-            for item in items if isinstance(items,list) else []:
-                if isinstance(item,dict) and isinstance(item.get('id'),str):
-                    counts[item['id']] = counts.get(item['id'],0)+1
+            anomalies = Counter()
+            for item in items:
+                if not isinstance(item,dict):
+                    anomalies['non-object item'] += 1
+                    continue
+                identity = item.get('id')
+                if not isinstance(identity,str):
+                    anomalies['item missing string id'] += 1
+                    continue
+                counts[identity] = counts.get(identity,0)+1
+                if identity not in expected:
+                    anomalies['unknown id'] += 1
+
+            failures = {}
+            for identity in expected:
+                if counts.get(identity,0) == 0:
+                    failures[identity] = 'missing from Gemini response'
+                elif counts[identity] != 1:
+                    failures[identity] = 'duplicate id in Gemini response'
+
             accepted = set()
-            for item in items if isinstance(items,list) else []:
+            for item in items:
                 if not isinstance(item,dict) or not isinstance(item.get('id'),str):
                     continue
                 identity = item['id']
@@ -226,21 +264,39 @@ class BatchGenerator:
                     continue
                 job = expected[identity]
                 try:
-                    product = item['product']
-                    if not isinstance(product,dict) or product.get('intentKey') not in INTENTS:
+                    product = item.get('product')
+                    if not isinstance(product,dict):
+                        failures[identity] = 'missing or invalid product object'
+                        LOG.debug('Rejected %s: %s',identity,failures[identity])
+                        continue
+                    if product.get('intentKey') not in INTENTS:
+                        failures[identity] = 'invalid intentKey'
+                        LOG.debug('Rejected %s: %s (%r)',identity,failures[identity],product.get('intentKey'))
                         continue
                     draft = validate_draft({k:v for k,v in product.items() if k in REQUIRED_FIELDS})
                     if set(product) != set(REQUIRED_FIELDS)|{'intentKey'}:
+                        failures[identity] = 'missing or extra product fields'
+                        LOG.debug('Rejected %s: %s',identity,failures[identity])
                         continue
-                    if transformation_issues(job['source'],job.get('external'),draft) or name_exists(draft.name):
+                    issues = transformation_issues(job['source'],job.get('external'),draft)
+                    if issues:
+                        failures[identity] = issues[0]
+                        LOG.debug('Rejected %s: %s',identity,'; '.join(issues))
+                        continue
+                    if name_exists(draft.name):
+                        failures[identity] = 'replacement name already exists'
+                        LOG.debug('Rejected %s: %s (%s)',identity,failures[identity],draft.name)
                         continue
                     output = draft.to_dict()
                     output['intentKey'] = product['intentKey']
                     save(job,output,model)  # Durable per-item save BEFORE processing another result.
                     accepted.add(identity)
+                    failures.pop(identity,None)
                     generated += 1
-                except (ValueError,KeyError,TypeError):
-                    continue
+                except (ValueError,KeyError,TypeError) as error:
+                    failures[identity] = 'schema/field validation failed'
+                    LOG.debug('Rejected %s: %s: %s',identity,type(error).__name__,error)
+
             for _ in group:
                 pending.popleft()
             failed = [j for j in group if j['id'] not in accepted]
@@ -248,8 +304,23 @@ class BatchGenerator:
                 tries[job['id']] = tries.get(job['id'],0)+1
                 if tries[job['id']] < 3:
                     pending.append(job)
-            LOG.info('Saved %d/%d products; fixed batch size %d; %d pending (only unfinished items retry)',
-                     len(accepted),len(group),self.size,len(pending))
+
+            reason_counts = Counter(failures.get(j['id'],'unknown rejection') for j in failed)
+            response_notes = [f'Gemini returned {len(items)} item(s)']
+            if response_truncated:
+                response_notes.append('response JSON was truncated; complete items were salvaged')
+            if response_problem:
+                response_notes.append(response_problem)
+            if anomalies:
+                response_notes.append('response anomalies: '+', '.join(f'{key}={value}' for key,value in sorted(anomalies.items())))
+            reason_text = ', '.join(f'{key}={value}' for key,value in sorted(reason_counts.items()))
+            if failed:
+                LOG.info(
+                    'Saved %d/%d products; %d unfinished will retry; %s; rejection reasons: %s; fixed batch size %d; %d pending',
+                    len(accepted),len(group),len(failed),'; '.join(response_notes),reason_text or 'unknown',self.size,len(pending))
+            else:
+                LOG.info('Saved %d/%d products; %s; fixed batch size %d; %d pending',
+                    len(accepted),len(group),'; '.join(response_notes),self.size,len(pending))
         if any(n>=3 for n in tries.values()):
             raise Paused('Some products failed validation three times; valid items saved. Rerun to retry only unfinished items.')
         return generated
