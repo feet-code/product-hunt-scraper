@@ -100,9 +100,13 @@ Equivalent: `run --stage generate --limit 100000 --publish`. Both use saved scra
 
 Both repositories default to **the same SQLite ledger** at `~/.magic-catalog/quotas.sqlite3` (your user home directory). Running them on the same computer and OS user shares Gemini request accounting, cooldowns, intent registration, and publishing budgets. Each scraper still has its own `.state` research checkpoint.
 
-Set these `.env` values to your actual AI Studio limits; defaults are conservative assumptions, not guaranteed Google quotas:
+A single `GEMINI_API_KEY` keeps the original behavior. To use independently authorized collaborator keys, set `GEMINI_API_KEYS` to a comma-separated list. Full generation requests rotate fairly across the configured keys. Each key gets its own persisted request counts and key/model cooldowns, while raw keys are never written to the quota database or logs. HTTP 429 affects only the key that received it; HTTP 503 is treated as model/service availability and cools that model across the pool so generation falls back to another model instead of replaying the same unavailable request on every key.
+
+Set these `.env` values to the limits that apply to each independently authorized key/project; defaults are conservative assumptions, not guaranteed Google quotas:
 
 ```text
+GEMINI_API_KEY=
+GEMINI_API_KEYS=collaborator-key-1,collaborator-key-2
 GEMINI_RPD=20
 GEMINI_RPM=5
 GEMINI_TPM=25000
@@ -110,7 +114,7 @@ GEMINI_QUOTA_SCOPE=default-project
 MAGIC_WRITE_SCOPE=cloudflare-account
 ```
 
-The limits above apply per configured model. The input-token estimate uses serialized request size; server 429s remain authoritative. The ledger reserves attempts **before** sending them, including failed requests. It saves model cooldowns, honors Retry-After, treats recognized daily-quota errors as unavailable until midnight Pacific, and skips missing models for 24 hours. Quota changes and cooldowns survive Ctrl+C and restarts.
+When a key pool is active, the configured limits above are enforced per key and per configured model by the local ledger. The input-token estimate uses serialized request size; server 429s remain authoritative. The ledger reserves attempts **before** sending them, including failed requests. It saves model cooldowns, honors Retry-After, treats recognized daily-quota errors as unavailable until midnight Pacific, and skips missing models for 24 hours. Quota changes and cooldowns survive Ctrl+C and restarts.
 
 Temporary availability waits are bounded to two minutes by default, with short interruptible waits. Use `--wait-minutes 0` to stop immediately when no model is ready. Daily exhaustion prints the next eligible time and leaves unfinished items queued. Model/key errors do not poison every remaining source row.
 
@@ -120,14 +124,17 @@ ph-magic-import status
 ph-magic-import retry-failed
 ```
 
-If you customize `MAGIC_QUOTA_DB`, give both repositories the **same absolute file path**. `GEMINI_QUOTA_SCOPE` identifies the actual Google project; do not change it merely to reset quotas. Two different API keys for the same project still need the same scope. Other programs and separate computers do not automatically share this ledger; leave headroom for their usage. Run at most one process per scraper checkpoint.
+`quota-status` reports each configured pool key as `key-1`, `key-2`, and so on without exposing credentials. If you customize `MAGIC_QUOTA_DB`, give both repositories the **same absolute file path**. `GEMINI_QUOTA_SCOPE` is a stable namespace for your local ledger and should not be changed merely to reset counters. Gemini quotas are ultimately enforced by Google at the project/service level: multiple API keys from the **same** Google project may share provider quota, so do not treat same-project duplicate keys as independent capacity. Pool only keys your collaborators have authorized for this shared workflow and whose actual quota arrangement permits independent use.
 
 ## Measured scalable publishing
 
 Set the following in each scraper's `.env`:
 
 ```text
+# Either one key...
 GEMINI_API_KEY=your-key
+# ...or a collaborator pool:
+# GEMINI_API_KEYS=key-one,key-two,key-three
 MAGIC_CATALOG_URL=https://magic-catalog.cloudwebsites.workers.dev
 MAGIC_CATALOG_IMPORT_TOKEN=the-same-value-as-the-Worker-ADMIN_REINDEX_TOKEN
 ```
@@ -154,7 +161,7 @@ If vector indexing was unavailable, `npm run vector:reindex` in Magic Catalog re
 python -m unittest discover -s tests -v
 ```
 
-Tests cover partial/truncated responses, wrong and duplicate IDs, fixed batch sizes and 503 fallback, model fallback, persisted daily/minute quotas, Pacific daylight-saving resets, intent reuse, server-advertised import caps, measured write accounting, partial failures, stable identities, and preservation of existing checkpoints.
+Tests cover partial/truncated responses, wrong and duplicate IDs, fixed batch sizes and 503 fallback, model fallback, persisted daily/minute quotas, collaborator-key rotation and isolation, Pacific daylight-saving resets, intent reuse, server-advertised import caps, measured write accounting, partial failures, stable identities, and preservation of existing checkpoints.
 
 
 ## Scrape now, generate and publish later
@@ -233,9 +240,10 @@ catalog credentials; it cannot find products published from another checkpoint.
 counts. Daily-quota 429, unspecified-quota 429, service-unavailable 503, transport
 failures, and successful HTTP responses are separate outcomes. The local request
 counter is conservative and includes failed requests; it is not a provider usage
-meter. Use AI Studio to verify actual project limits and consumption. Gemini
-limits are per project rather than per API key, so multiple keys on one project
-share quota. No key rotation to bypass free-tier quota is performed.
+meter. Use AI Studio to verify actual project limits and consumption. Collaborator
+key rotation is supported for independently authorized keys, but multiple keys on
+one Google project may still share the same provider quota and should not be used
+as though they create extra project capacity.
 
 ## Publish manual edits to an export
 
