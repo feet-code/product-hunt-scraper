@@ -8,6 +8,7 @@ from .batch import BatchGenerator, BulkPublisher, Ledger, Paused, stable_product
 from .gemini import source_content_hash
 from .models import CatalogDraft, SitemapEntry
 from .pipeline import write_preview
+from .brand_audit import blocked_names, name_key, issues_for
 
 LOG = logging.getLogger(__name__)
 
@@ -68,12 +69,13 @@ def _run_cycle(pipeline,entries,args,settings,gemini_client,publish_client):
             if jobs:
                 transformer = BatchGenerator(gemini_client,settings.gemini_api_key,settings.gemini_models,ledger,
                     args.batch_size,args.max_batch_size,args.wait_minutes)
+                known_names = blocked_names(state)
                 transformer.on_batch = flush
                 def save(job,product,model):
                     draft = CatalogDraft.from_dict(product)
                     state.mark_transformed(job['id'],draft,model,source_content_hash(job['source'],job['external']))
                 try:
-                    transformer.generate(jobs,save,lambda name:state.draft_name_exists(name,''))
+                    transformer.generate(jobs,save,lambda name:state.draft_name_exists(name,'') or name_key(name) in known_names)
                 except Paused as error:
                     LOG.warning('%s',error)
                     paused = True
@@ -90,14 +92,20 @@ def publish_saved(pipeline, entries, args, settings, publish_client, ledger):
     state = pipeline.state
     products = []
     identities = {}
+    known_names = blocked_names(state)
     for entry in entries:
         item = state.get_work_item(entry.url)
         if not item.draft or item.status=='published':
             continue
+        issues = issues_for(item, known_names)
+        if issues:
+            raise RuntimeError('Blocked unsafe saved draft '+item.draft.name+': '+ '; '.join(issues)+'. Run audit-brands --repair, then generate-publish.')
         key = 'scalable-product:'+entry.url
         stored = state.connection.execute('SELECT value FROM metadata WHERE key=?',(key,)).fetchone()
         if stored:
-            product = json.loads(stored[0])
+            previous = json.loads(stored[0])
+            product = {**previous, **item.draft.to_dict()}
+            state.set_metadata(key,json.dumps(product,separators=(',',':')))
         else:
             product = stable_product(item.draft.to_dict(),entry.url,'ph',datetime.now(timezone.utc).isoformat().replace('+00:00','Z'))
             state.set_metadata(key,json.dumps(product,separators=(',',':')))

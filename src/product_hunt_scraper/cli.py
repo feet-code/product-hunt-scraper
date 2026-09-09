@@ -82,6 +82,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--daily-row-budget",type=int,default=80000)
     run.add_argument("--wait-minutes",type=float,default=2)
     subparsers.add_parser('quota-status')
+    audit_parser = subparsers.add_parser('audit-brands', help='Find known brand collisions in saved and published drafts')
+    audit_parser.add_argument('--state', type=_path, default=_path('.state/scraper.sqlite3'))
+    audit_parser.add_argument('--repair', action='store_true', help='Back up checkpoint and queue flagged records for regeneration at their existing URLs')
 
     status = subparsers.add_parser("status", help="show persistent checkpoint counts")
     status.add_argument("--state", type=_path, default=_path(".state/scraper.sqlite3"))
@@ -196,6 +199,12 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
+        if arguments.command == 'audit-brands':
+            from .brand_audit import audit
+            with StateStore(arguments.state) as state:
+                result = audit(state, arguments.repair)
+            print(json.dumps(result, indent=2))
+            return 0
         if arguments.command == 'quota-status':
             from .config import configured_models
             ledger = Ledger()

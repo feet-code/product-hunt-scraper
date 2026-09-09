@@ -205,3 +205,34 @@ thinking tokens, and the requested output cap. The output allowance is increased
 and thinking is disabled for Gemini 2.5 Flash. Other models retain their defaults.
 Ordinary descriptive words from source titles are allowed; distinctive source
 names/tokens and confusingly similar replacement names are still rejected.
+
+## Audit and repair published brand collisions
+
+```bash
+ph-magic-import audit-brands
+ph-magic-import audit-brands --repair
+ph-magic-import run --stage generate-publish --limit 100000 --batch-size 10
+```
+
+Use your existing checkpoint file (add the same `--state` to each command if needed).
+The audit checks all saved drafts, including published records, against known source
+names, source slugs, and a blocklist that includes AlphaSentinel and SkillForge.
+Matching ignores case, spacing, and punctuation. Set `BRAND_BLOCKLIST_FILE` to a
+UTF-8 file with one additional prohibited name per line. New generation and saved
+publish payloads both use these checks. Generic descriptive words remain allowed.
+This is collision screening against known names, not worldwide name clearance.
+
+`--repair` first creates a SQLite backup beside your checkpoint, then clears only
+flagged drafts and queues regeneration. Original research and remote identities
+are retained. The next generate/publish run updates the existing scalable catalog
+records at their existing URLs, replacing the old copy and search text. The audit
+itself does not change live pages. This needs the original local checkpoint and
+catalog credentials; it cannot find products published from another checkpoint.
+
+`quota-status` shows configured limits, local attempted calls and recent outcome
+counts. Daily-quota 429, unspecified-quota 429, service-unavailable 503, transport
+failures, and successful HTTP responses are separate outcomes. The local request
+counter is conservative and includes failed requests; it is not a provider usage
+meter. Use AI Studio to verify actual project limits and consumption. Gemini
+limits are per project rather than per API key, so multiple keys on one project
+share quota. No key rotation to bypass free-tier quota is performed.

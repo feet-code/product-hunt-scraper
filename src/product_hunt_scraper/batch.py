@@ -42,6 +42,7 @@ class Ledger:
         self.db = sqlite3.connect(path,timeout=30)
         self.db.row_factory = sqlite3.Row
         self.db.executescript('''
+          CREATE TABLE IF NOT EXISTS outcomes(scope TEXT, model TEXT, at REAL, kind TEXT);
           CREATE TABLE IF NOT EXISTS calls(scope TEXT, model TEXT, day TEXT, at REAL, tokens INTEGER);
           CREATE INDEX IF NOT EXISTS call_lookup ON calls(scope,model,day,at);
           CREATE TABLE IF NOT EXISTS cooldown(scope TEXT,model TEXT,until REAL,PRIMARY KEY(scope,model));
@@ -91,10 +92,18 @@ class Ledger:
             self.db.rollback()
             raise
 
+    def record_outcome(self, model, kind):
+        with self.db:
+            self.db.execute("INSERT INTO outcomes VALUES(?,?,?,?)", (self.scope, model, self.clock(), kind))
+
     def block(self,model,error):
         now = self.clock()
         body = (error.body or '').lower()
         daily = error.status == 429 and any(s in body for s in ('perday','per_day','per day','daily'))
+        kind = 'daily_quota_429' if daily else ('quota_429_unspecified' if error.status == 429 else
+            'service_unavailable_503' if error.status == 503 else 'transport_failure' if error.status is None else 'http_'+str(error.status))
+        self.record_outcome(model, kind)
+        LOG.warning('Gemini %s classified as %s; 503/transport failures do not confirm quota exhaustion', model, kind)
         until = next_day(now) if daily else now+max(65,float(getattr(error,'retry_after',None) or 0))
         if error.status == 503:
             until = now+max(300,float(getattr(error,'retry_after',None) or 0))
@@ -109,6 +118,10 @@ class Ledger:
     def summary(self,models):
         return {m:{'calls_today':self.db.execute('SELECT count(*) FROM calls WHERE scope=? AND model=? AND day=?',
             (self.scope,m,pacific_day(self.clock()))).fetchone()[0],
+            'configured_rpd':self.rpd,
+            'quota_count_note':'Local attempted requests, not provider-confirmed usage; includes failures and excludes other clients.',
+            'recent_outcomes':dict(self.db.execute('SELECT kind,count(*) FROM outcomes WHERE scope=? AND model=? AND at>=? GROUP BY kind',
+                (self.scope,m,next_day(self.clock())-86400)).fetchall()),
             'ready_at':datetime.fromtimestamp(self.ready_at(m),timezone.utc).isoformat()} for m in models}
 
 
@@ -208,6 +221,7 @@ class BatchGenerator:
             try:
                 response = self.client.post_json('https://generativelanguage.googleapis.com/v1beta/models/'+quote(model,safe='')+':generateContent',
                     payload,max_bytes=4000000,headers={'x-goog-api-key':self.api_key})
+                self.ledger.record_outcome(model, 'http_success')
                 envelope = json.loads(response.text())
                 candidate = (envelope.get('candidates') or [{}])[0]
                 usage = envelope.get('usageMetadata') or {}
