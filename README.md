@@ -236,3 +236,25 @@ counter is conservative and includes failed requests; it is not a provider usage
 meter. Use AI Studio to verify actual project limits and consumption. Gemini
 limits are per project rather than per API key, so multiple keys on one project
 share quota. No key rotation to bypass free-tier quota is performed.
+
+## Publish manual edits to an export
+
+Normal publishing reads SQLite; changing a JSON export alone does not change it.
+To publish edited JSON arrays, `{"products": [...]}` objects, or JSONL exports:
+
+```bash
+ph-magic-import run --stage publish --input products.json --limit 100000
+```
+
+Use your actual filename (for example `.state/products.jsonl`) and the original
+checkpoint (`--state` if customized). Preserve `slug`, `id`, and `createdAt`;
+edit the content fields. All input records are validated before edits are applied.
+Unknown slugs, invalid content, known brand collisions, and duplicate names are
+rejected. A checkpoint backup is created before changes. Changed products are
+queued even if previously published; acknowledged unchanged products are skipped.
+The same command safely resumes after a publish failure. `--limit` caps publishing
+per invocation (default 3), not the number of edits queued. The input file is never
+overwritten during this command. No Gemini generation is needed.
+
+Copy an edited export to a separate file before running other commands: normal
+pipeline runs can regenerate `.state/products.jsonl` from the checkpoint.

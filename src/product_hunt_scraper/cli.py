@@ -41,6 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help="target at most this many Product Hunt products (default: 3; no fixed maximum)",
     )
+    run.add_argument("--input", type=_path, help="Publish edited JSON/JSONL exports using their existing slugs; only with --stage publish")
     run.add_argument("--offset", type=int, default=0, help="skip this many sitemap entries")
     run.add_argument(
         "--order", choices=("newest", "sitemap"), default="newest"
@@ -114,6 +115,10 @@ def _client(settings: Settings, *, max_attempts: int) -> PoliteHttpClient:
 
 
 def run_command(arguments: argparse.Namespace) -> int:
+    if arguments.input and (arguments.stage != 'publish' or arguments.scrape_only):
+        raise ValueError('--input requires --stage publish.')
+    if arguments.input and arguments.offset:
+        raise ValueError('--offset is not supported with --input.')
     if arguments.limit < 1:
         raise ValueError("--limit must be positive.")
     if arguments.offset < 0:
@@ -158,7 +163,12 @@ def run_command(arguments: argparse.Namespace) -> int:
             publish_batch_size=arguments.publish_batch_size,
             max_failures=arguments.max_failures,
         )
-        if arguments.stage in ('all','scrape') and not arguments.offline:
+        if arguments.input:
+            from .file_edits import queue_file_edits
+            entries, report = queue_file_edits(state, arguments.input)
+            logging.getLogger(__name__).info('File edits: %s', json.dumps(report))
+            entries = entries[:arguments.limit]
+        elif arguments.stage in ('all','scrape') and not arguments.offline:
             entries = pipeline.discover(limit=arguments.limit,offset=arguments.offset,order=arguments.order,stats=stats)
         else:
             entries = saved_entries(state, arguments.limit, arguments.offset,

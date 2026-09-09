@@ -133,4 +133,5 @@ def run_bulk(pipeline, entries, args, settings, gemini_client, publish_client):
             LOG.info('No pending eligible products for this stage.')
         return result
     finally:
-        write_preview(settings.preview_path, pipeline.state.transformed_records())
+        if not getattr(args, 'input', None):
+            write_preview(settings.preview_path, pipeline.state.transformed_records())
