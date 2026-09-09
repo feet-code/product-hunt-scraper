@@ -216,11 +216,34 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result, indent=2))
             return 0
         if arguments.command == 'quota-status':
-            from .config import configured_models
+            from .config import configured_gemini_api_keys, configured_models
+            keys = configured_gemini_api_keys()
             ledger = Ledger()
+            pool = None
             try:
-                print(json.dumps(ledger.summary(configured_models()),indent=2))
+                if len(keys) > 1:
+                    from .key_pool import GeminiKeyPoolLedger
+                    pool = GeminiKeyPoolLedger(ledger, keys)
+                    result = {
+                        'mode': 'key-pool',
+                        'configured_keys': len(keys),
+                        'limits_per_key': {
+                            'rpd': ledger.rpd,
+                            'rpm': ledger.rpm,
+                            'tpm': ledger.tpm,
+                        },
+                        'keys': pool.summary(configured_models()),
+                    }
+                else:
+                    result = {
+                        'mode': 'single-key',
+                        'configured_keys': len(keys),
+                        'models': ledger.summary(configured_models()),
+                    }
+                print(json.dumps(result,indent=2))
             finally:
+                if pool is not None:
+                    pool.close()
                 ledger.db.close()
             return 0
         if arguments.command == "run":
@@ -245,4 +268,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
