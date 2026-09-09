@@ -69,9 +69,20 @@ def _run_cycle(pipeline,entries,args,settings,gemini_client,publish_client):
                 if item.source and item.external_checked and not item.draft and item.status!='published' and item.attempts<args.max_failures:
                     jobs.append({'id':entry.url,'source':item.source,'external':item.external_page})
             if jobs:
-                key_pool = GeminiKeyPoolLedger(ledger, settings.gemini_api_keys)
-                pooled_client = PooledGeminiClient(gemini_client, key_pool)
-                transformer = BatchGenerator(pooled_client,settings.gemini_api_key,settings.gemini_models,key_pool,
+                configured_keys = tuple(getattr(settings, 'gemini_api_keys', ()) or ())
+                if not configured_keys:
+                    legacy_key = getattr(settings, 'gemini_api_key', '')
+                    configured_keys = (legacy_key,) if legacy_key else ()
+                if len(configured_keys) > 1:
+                    key_pool = GeminiKeyPoolLedger(ledger, configured_keys)
+                    generator_client = PooledGeminiClient(gemini_client, key_pool)
+                    generator_ledger = key_pool
+                    generator_key = configured_keys[0]
+                else:
+                    generator_client = gemini_client
+                    generator_ledger = ledger
+                    generator_key = configured_keys[0] if configured_keys else ''
+                transformer = BatchGenerator(generator_client,generator_key,settings.gemini_models,generator_ledger,
                     args.batch_size,args.max_batch_size,args.wait_minutes)
                 known_names = blocked_names(state)
                 transformer.on_batch = flush
